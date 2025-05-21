@@ -1,0 +1,452 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: "CloudFormation Template for File Processing Using AWS Textract Service for scanned images, Word, and PDFs."
+
+Parameters:
+  InputS3BucketName:
+    Type: String
+    Default: file-extraction-input-s3-bucket
+    Description: Enter name of S3 Bucket for storing input files. Default is file-extraction-input-s3-bucket.
+
+  FrontendSourceCodeS3BucketName:
+    Type: String
+    Default: file-extraction-code-for-cloudformation
+    Description: Enter name of S3 Bucket which contains the source code of frontend(.zip). Which will be used by Elastic Beanstalk.
+
+  FrontendSourceCodeS3KeyName:
+    Type: String
+    Default: file-extraction-frontend.zip
+    Description: Enter name of S3 Object Key of the source code of frontend(.zip). Which will be used by Elastic Beanstalk.
+
+  SenderEmail:
+    Type: String
+    Default: 
+    Description: Enter email from which you want to send emails to users with extracted files.
+
+Resources:
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: LambdaDLQ
+      VisibilityTimeout: 300 
+
+  # Lambda function to generate a pre-signed URL for an S3 object upload
+  GenerateS3PresignedURLFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs20.x
+      Role: arn:aws:iam::
+      Handler: index.handler
+      Environment:
+        Variables:
+          INPUT_BUCKET_NAME: !Ref InputS3BucketName
+          SNS_TOPIC_ARN: !Ref FileExtractionSNSTopic
+      Code:
+        S3Bucket: !Ref FrontendSourceCodeS3BucketName
+        S3Key: GenerateS3PresignedURLFunction.zip
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn 
+      Description: "Generates a pre-signed URL for an S3 object, associating it with an email tag."
+
+  # Lambda function to create the Textract job
+  CreateTextExtractionJobFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs20.x
+      Role: arn:aws:iam::
+      Handler: index.handler
+      Timeout: 70
+      Code:
+        S3Bucket: !Ref FrontendSourceCodeS3BucketName
+        S3Key: CreateTextExtractionJobFunction.zip
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn 
+      Description: "Creates a Textract extraction job based on the S3 Object uploaded by the frontend. Triggered by S3 object upload."
+
+  # Lambda function to send email after Textract job completion
+  SendEmailWithExtractedFileFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs20.x
+      Role: arn:aws:iam::
+      Handler: index.handler
+      Timeout: 60
+      Environment:
+        Variables:
+          SES_SENDER: !Ref SenderEmail
+          S3_BUCKET_NAME: !Ref InputS3BucketName
+          PROCESSED_BUCKET_NAME: !Ref InputS3BucketName
+          SNS_TOPIC_ARN: !Ref FileExtractionSNSTopic
+  
+      Code:
+        S3Bucket: !Ref FrontendSourceCodeS3BucketName
+        S3Key: SendEmailWithExtractedFileFunction.zip
+      Layers:
+        - arn:aws:lambda:us-east-1:618352127426:layer:axioslayer:1
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn 
+      Description: "Sends the extracted file to the user via email. Triggered by EventBridge when Textract job is completed."
+
+  # S3 Bucket to store input files
+  InputS3Bucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+    - PermissionForS3ToInvokeLambda
+    - PermissionForS3ToInvokeSendEmailLambda
+    Properties:
+      BucketName: !Ref InputS3BucketName
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - PUT
+            AllowedOrigins:
+              - "*"
+            Id: myCORSRuleId1
+            MaxAge: 3600
+      LifecycleConfiguration:
+        Rules:
+          - Id: "MoveToIntelligentTiering"
+            Status: Enabled
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 1
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+            Function: !GetAtt CreateTextExtractionJobFunction.Arn
+          - Event: s3:ObjectCreated:Put
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: processed/
+                  - Name: suffix
+                    Value: .txt
+            Function: !GetAtt SendEmailWithExtractedFileFunction.Arn
+      VersioningConfiguration:
+        Status: Enabled  # Enable versioning on the bucket
+
+  # Permission for S3 to invoke the Lambda function when a file is uploaded
+  PermissionForS3ToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreateTextExtractionJobFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${InputS3BucketName}"
+
+  # Permission for S3 to invoke the SendEmailWithExtractedFileFunction Lambda
+  PermissionForS3ToInvokeSendEmailLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SendEmailWithExtractedFileFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${InputS3BucketName}"
+
+  # API Gateway for generating S3 presigned URL
+  GenerateS3PresignedURLLambdaRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: GenerateS3PresignedURLLambdaRestApi
+      Description: "API Gateway for GenerateS3PresignedURL Lambda Function"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # Resource to handle POST requests for uploading files to S3
+  UploadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref GenerateS3PresignedURLLambdaRestApi
+      ParentId: !GetAtt
+        - GenerateS3PresignedURLLambdaRestApi
+        - RootResourceId
+      PathPart: "upload"
+
+  # POST method for uploading files via the API
+  UploadResourcePOST:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref GenerateS3PresignedURLLambdaRestApi
+      ResourceId: !Ref UploadResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub >-
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GenerateS3PresignedURLFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # OPTIONS method for handling pre-flight requests
+  UploadResourceOPTIONS:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref GenerateS3PresignedURLLambdaRestApi
+      ResourceId: !Ref UploadResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'*'"
+            method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Deployment of API Gateway
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - UploadResourcePOST
+      - UploadResourceOPTIONS
+    Properties:
+      RestApiId: !Ref GenerateS3PresignedURLLambdaRestApi
+      Description: Prod Deployment
+
+  # Prod stage for API Gateway
+  Prod:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: prod
+      Description: Prod Stage
+      RestApiId: !Ref GenerateS3PresignedURLLambdaRestApi
+      DeploymentId: !Ref Deployment
+
+  # SNS Topic for notifications (email subscription for extracted files)
+  FileExtractionSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "File Extraction Notification Topic"
+      TopicName: "FileExtractionNotificationTopic"
+
+  # SNS Subscription for email notifications
+  FileExtractionSNSTopicEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref SenderEmail
+      Protocol: email
+      TopicArn: !Ref FileExtractionSNSTopic
+
+  # Permision for API gateway to invoke Lambda
+  PermissionForAPIGatewayToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GenerateS3PresignedURLFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GenerateS3PresignedURLLambdaRestApi}/*/POST/upload"
+
+  # Elastic Beanstalk Application for the frontend
+  ElasticBeanstalkApplication:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      ApplicationName: "FileExtractionFrontend"
+      Description: "Elastic Beanstalk Application for the File Extraction Frontend"
+
+  # Elastic Beanstalk Application Version
+  EBAppVersion1:
+    Type: AWS::ElasticBeanstalk::ApplicationVersion
+    Properties:
+      ApplicationName: !Ref ElasticBeanstalkApplication
+      Description: "Application version for frontend"
+      SourceBundle:
+        S3Bucket: !Ref FrontendSourceCodeS3BucketName
+        S3Key: !Ref FrontendSourceCodeS3KeyName
+
+  # Elastic Beanstalk Environment for the frontend
+  EBEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref ElasticBeanstalkApplication
+      Description: "Elastic Beanstalk Environment running Dockerized react frontend"
+      EnvironmentName: prod
+      CNAMEPrefix: FileExtractionFrontend
+      SolutionStackName: "64bit Amazon Linux 2023 v4.4.1 running Docker"
+      VersionLabel: !Ref EBAppVersion1
+      OptionSettings:
+        # Enable Load Balanced Environment with Multi-AZ
+        - Namespace: 'aws:elasticbeanstalk:environment'
+          OptionName: EnvironmentType
+          Value: LoadBalanced
+        # Auto-scaling settings for Multi-AZ deployment
+        - Namespace: 'aws:autoscaling:asg'
+          OptionName: MinSize
+          Value: 2
+        - Namespace: 'aws:autoscaling:asg'
+          OptionName: MaxSize
+          Value: 6
+        
+        # Load balancer settings for Multi-AZ
+        - Namespace: 'aws:elasticbeanstalk:environment'
+          OptionName: LoadBalancerType
+          Value: application # Use an ALB
+          
+        # Auto-scaling triggers
+        - Namespace: 'aws:autoscaling:trigger'
+          OptionName: MeasureName
+          Value: CPUUtilization
+        - Namespace: 'aws:autoscaling:trigger'
+          OptionName: Statistic
+          Value: Average
+        - Namespace: 'aws:autoscaling:trigger'
+          OptionName: Unit
+          Value: Percent
+        - Namespace: 'aws:autoscaling:trigger'
+          OptionName: LowerThreshold
+          Value: 30
+        - Namespace: 'aws:autoscaling:trigger'
+          OptionName: UpperThreshold
+          Value: 70
+        - Namespace: 'aws:autoscaling:trigger'
+          OptionName: BreachDuration
+          Value: 1
+        
+        # EC2 instance settings
+        - Namespace: 'aws:autoscaling:launchconfiguration'
+          OptionName: IamInstanceProfile
+          Value: LabInstanceProfile
+        - Namespace: 'aws:elasticbeanstalk:environment'
+          OptionName: ServiceRole
+          Value: LabRole
+        - Namespace: 'aws:ec2:instances'
+          OptionName: InstanceTypes
+          Value: t3.medium
+        - Namespace: 'aws:elasticbeanstalk:application:environment'
+          OptionName: REACT_APP_API_GATEWAY_URL
+          Value: !Sub "https://${GenerateS3PresignedURLLambdaRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Prod}/upload"
+        - Namespace: 'aws:elasticbeanstalk:healthreporting:system'
+          OptionName: SystemType
+          Value: enhanced
+        - Namespace: 'aws:elasticbeanstalk:healthreporting:system'
+          OptionName: 'HealthCheckSuccessThreshold'
+          Value: 'Ok' 
+        - Namespace: 'aws:elasticbeanstalk:application'
+          OptionName: 'Application Healthcheck URL'
+          Value: '/health' 
+
+  # Enabling Guard Duty
+  GuardDutyDetector:
+    Type: "AWS::GuardDuty::Detector"
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: "FIFTEEN_MINUTES" 
+
+  # CloudWatch Alarm for S3 Bucket 4xx Errors
+  InputS3Bucket4xxErrorsAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmName: "InputS3Bucket4xxErrorsAlarm"
+      AlarmDescription: "Alarm when the S3 bucket has 4xx errors."
+      Namespace: "AWS/S3"
+      MetricName: "4xxErrors"
+      Dimensions:
+        - Name: "BucketName"
+          Value: !Ref InputS3Bucket
+        - Name: "StorageType"
+          Value: "StandardStorage"
+      Statistic: "Sum"
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: "GreaterThanOrEqualToThreshold"
+      AlarmActions:
+        - !Ref FileExtractionSNSTopic
+      OKActions:
+        - !Ref FileExtractionSNSTopic
+
+  # CloudWatch Alarm for API Gateway 5xx Errors
+  ApiGateway5xxErrorsAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmName: "ApiGateway5xxErrorsAlarm"
+      AlarmDescription: "Alarm when API Gateway returns 5xx errors."
+      Namespace: "AWS/ApiGateway"
+      MetricName: "5XXError"
+      Dimensions:
+        - Name: "ApiName"
+          Value: !Ref GenerateS3PresignedURLLambdaRestApi
+      Statistic: "Sum"
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: "GreaterThanOrEqualToThreshold"
+      AlarmActions:
+        - !Ref FileExtractionSNSTopic
+      OKActions:
+        - !Ref FileExtractionSNSTopic
+
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "/aws/file-extraction-logs"
+      RetentionInDays: 14
+
+  # CloudWatch Metric Filter for Log Group
+  LogGroupMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudWatchLogGroup
+      FilterPattern: '"ERROR"'  # Change this pattern based on the logs you want to capture (e.g., look for the word "ERROR")
+      MetricTransformations:
+        - MetricName: "LogErrorMetric"
+          MetricNamespace: "Custom/Logs"
+          MetricValue: "1"  # You can set the value to "1" to count each occurrence of the pattern
+          
+  # CloudWatch Alarm for Log Group Errors
+  LogGroupErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: "LogGroupErrorAlarm"
+      AlarmDescription: "Triggered when errors are logged in CloudWatch Log Group."
+      MetricName: "LogErrorMetric"
+      Namespace: "Custom/Logs"
+      Statistic: "Sum"
+      Period: 300  # Evaluate every 5 minutes
+      EvaluationPeriods: 1
+      Threshold: 1  # Trigger the alarm when 1 or more errors are found
+      ComparisonOperator: "GreaterThanOrEqualToThreshold"
+      AlarmActions:
+        - !Ref FileExtractionSNSTopic  # Send the notification to the SNS Topic
+      OKActions:
+        - !Ref FileExtractionSNSTopic  # Optionally send an email when the alarm state returns to OK
+
+Outputs:
+  POSTUploadAPIGatewayURL:
+    Description: "URL for the POST request to generate S3 pre-signed URLs"
+    Value: !Sub "https://${GenerateS3PresignedURLLambdaRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Prod}/upload"
+
+  BeanstalkFrontendURL:
+    Description: "URL for the Elastic Beanstalk frontend application"
+    Value: !Sub "http://FileExtractionFrontend.${AWS::Region}.elasticbeanstalk.com"
+
+  FileExtractionSNSTopicARN:
+    Description: "SNS Topic ARN for file extraction notifications"
+    Value: !Ref FileExtractionSNSTopic
